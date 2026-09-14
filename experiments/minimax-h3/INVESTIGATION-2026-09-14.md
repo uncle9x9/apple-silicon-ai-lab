@@ -2,13 +2,13 @@
 
 Date: 2026-09-14  
 Machine: MacBook Pro, M2 Max, 30-core GPU, 32 GB unified memory  
-Status: **active; upstream Qwen3VL conditioning path exonerated, blocker moved downstream to H3 DiT/keyframe integration**
+Status: **active; reference routing exonerated through DiT, current P0 is H3 DiT QKV checkpoint layout**
 
 ## Problem statement
 
-Native MiniMax-H3 32B Q4 conditioning is computationally viable with staged execution, but earlier Ref2VA runs showed poor reference adherence after frame 0. The investigation therefore focused on locating the first point where reference-image information was lost or corrupted.
+Native MiniMax-H3 32B Q4 conditioning is computationally viable with staged execution, but earlier full-video runs showed poor reference adherence after frame 0. The investigation therefore focused on locating the first point where reference-image information was lost, corrupted or semantically misinterpreted.
 
-The key rule throughout was: **do not patch or optimise until a discriminating experiment identifies the failing subsystem.**
+The governing rule is: **do not patch or optimise until a discriminating experiment identifies the failing contract.**
 
 ## Phase 1 — GGMLOps vs plain ops
 
@@ -32,7 +32,7 @@ Measured L2 norms were bit-identical at every checkpoint:
 
 **Conclusion:** `GGMLOps` is not the cause.
 
-## Phase 2 — QKV and structural validation
+## Phase 2 — Qwen3VL QKV and structural validation
 
 The real production `Qwen3VLVisionModel` loaded with:
 
@@ -57,7 +57,7 @@ A permutation search against an official Qwen3-VL-8B reference strongly favoured
 
 The 8B reference showed much smaller DeepStack/merger magnitudes, but this was later proven to be an invalid cross-model baseline rather than a local bug.
 
-## Phase 3 — Official MiniMax-H3 oracle
+## Phase 3 — Official MiniMax-H3 encoder oracle
 
 The exact official MiniMax-H3 encoder shard was downloaded and SHA-256 verified:
 
@@ -98,7 +98,7 @@ Token accounting was internally consistent:
 - B: 116 tokens; all text;
 - final A token tags: 258 image / 122 text, including the expected vision boundary tokens.
 
-The decisive test compared the literal shared prompt-text suffix between A and B. If the reference image were being ignored, these text hidden states would remain nearly identical through depth.
+The decisive test compared the literal shared prompt-text suffix between A and B.
 
 | Layer | Mean cosine A vs B | Min cosine | Relative L2 difference |
 |---:|---:|---:|---:|
@@ -120,40 +120,94 @@ The final image-tagged conditioning is finite and non-degenerate:
 
 **Conclusion:** the Qwen3VL/50-layer LLM conditioning path is functioning and reference-sensitive.
 
-## Current blocker
+## Phase 5 — Production H3 DiT A/C test
 
-The first four phases exonerate the complete upstream reference-conditioning chain:
+The next test instrumented the actual production H3 DiT path rather than another upstream proxy.
 
-- GGUF loading;
-- mmproj conversion;
-- GGMLOps;
-- QKV ordering;
-- DeepStack mapping;
-- vision-tower weights and activations;
-- image-token placement and masks;
-- DeepStack injection into the LLM;
-- 50-layer Qwen3VL/LLM propagation.
+Diagnostic configuration:
 
-The unresolved subsystem is now downstream:
+- portrait 288x512;
+- 5 frames;
+- 2 denoising steps;
+- serial execution;
+- A: real reference image;
+- C: ablated/no-image control;
+- otherwise identical prompt, seed and sampling configuration.
 
-```text
-reference image
-  -> Qwen3VL vision tower            [exonerated]
-  -> 50-layer Qwen3VL/LLM            [exonerated]
-  -> final H3 conditioning
-  -> MiniMaxH3ImageToVideo
-  -> minimax_keyframes / VAE anchor
-  -> H3 DiT conditioning consumption [current blocker]
-  -> sampled latent
-  -> video
-```
+The real-reference Stage B run took approximately 96 seconds total.
 
-The next experiment must determine whether changing the reference image materially changes:
+### DiT boundary and block observations
 
-1. the conditioning actually passed into H3 DiT;
-2. cross-attention or equivalent conditioning consumption;
-3. representative early/mid/late DiT blocks;
-4. the final predicted latent/noise.
+A:
+
+- context shape: `(1, 268, 5376)`;
+- 146 image-tagged / 122 text-tagged positions;
+- context std: image `2.222`, text `2.220`.
+
+C:
+
+- context shape: `(1, 116, 5376)`;
+- no image-tagged positions;
+- text std: `2.230`.
+
+Representative checkpoints:
+
+| Checkpoint | A | C |
+|---|---:|---:|
+| block 0 post std / L2 | 180.9 / 354980 | 243.6 / 365982 |
+| block 25 pre std / L2 | 966.4 / 1895972 | 1166.6 / 1753019 |
+| block 49 pre std / L2 | 5508.9 / 10808190 | 5088.7 / 7646727 |
+| final predicted latent mean / std | -0.0366 / 1.856 | -0.1867 / 2.105 |
+
+Direct final-latent comparison:
+
+- cosine similarity: `0.8372`;
+- relative L2 difference: `0.549`;
+- no NaN/Inf observed.
+
+This is a substantial, coherent difference rather than an ignored-reference result.
+
+### Static trace
+
+The production path was also traced through:
+
+- `extra_conds`;
+- `minimax_token_tags`;
+- `minimax_keyframes`;
+- `preprocess_text_embeds`;
+- packed text/condition/audio/video sequence construction;
+- DiT attention;
+- keyframe RoPE positioning.
+
+No routing, masking or silent-bypass defect was found in the exercised graph.
+
+### Conditional scheduled-CLIP defect
+
+A separate real defect was identified in a scheduled CLIP branch: with `use_clip_schedule=True`, one path can rebuild the output dictionary without preserving extras such as `minimax_token_tags`.
+
+This did **not** affect the tested workflow. The captured DiT boundary contained populated image tags, empirically ruling that condition out for this run.
+
+**Conclusion:** the tested H3 DiT/keyframe path is reference-sensitive. The original full-video drift is not explained by a silent reference-routing failure.
+
+## New validation track — antirez/h3.c
+
+An independent Apple-Silicon implementation is now used as a correctness oracle:
+
+- repository: `https://github.com/antirez/h3.c`
+- pinned HEAD: `8974cc055ea9c02fcd14cc27dfda3e1027c05153`
+- current upstream focus: native MiniMax-H3 inference, FL2VA/Ref2VA, Metal optimisation and SSD-streamed low-memory execution.
+
+The h3.c README and tests state that the released MiniMax-H3 **DiT** checkpoint stores QKV rows **interleaved per attention head**. h3.c consumes this grouped layout directly.
+
+Current ComfyUI MiniMax-H3 attention performs a conventional three-way split of `qkv_proj(x)` into large Q/K/V blocks.
+
+This is a real semantic discrepancy, but it is **not yet proof of a ComfyUI defect** because the production GGUF conversion may already reorder the raw checkpoint into the contiguous layout ComfyUI expects.
+
+Therefore the current P0 question is:
+
+> **What row layout is actually present in the exact production-loaded DiT QKV tensor?**
+
+The next test must recover that layout using exact row/permutation evidence, not aggregate norms.
 
 ## 32 GB unified-memory constraint
 
@@ -168,30 +222,41 @@ Operational policy:
 - record wall-clock time, memory pressure and swap around heavy runs;
 - reduce resolution/frames/steps before adding concurrency.
 
-## Planned diagnostic micro-render
+h3.c's `--ssd-streaming` mode is especially relevant because it explicitly trades speed for lower DiT residency while keeping original BF16 weights.
 
-After the DiT trace, run a tiny diagnostic A/B/C render if the numerical evidence warrants it:
+## FL2VA vs Ref2VA
 
-- portrait 9:16;
-- smallest valid H3-aligned resolution determined from code/RUNBOOK;
-- 5 frames if the confirmed constraint is `frames % 17 == 5`;
-- 2–4 steps;
-- fixed seed, prompt, sampler and all other settings;
-- A: reference image 1;
-- B: materially different reference image 2;
-- C: safe ablated/neutral control if supported;
-- renders strictly serial.
+The investigation must keep task semantics separate:
 
-This is a **diagnostic smoke test**, not a quality benchmark.
+- **FL2VA:** first/last-frame anchoring;
+- **Ref2VA:** ordered subject/reference media.
 
-## External acceleration lead — unverified
+A long-video identity drift under first-frame anchoring does not establish that Ref2VA is broken.
 
-A community YouTube report described an Apple-Silicon MiniMax-H3 acceleration path using `h3.c` plus a `lightx2v` Turbo patch, with step reduction from 12 to 8 or 4. Reported figures included approximately 18:17 -> 8:11 for a 9-second video and 35:51 -> 14:56 for a 15-second video, together with a warning that a strength coefficient error of 16x produced blurred output.
+After the QKV-layout question is closed, the planned independent comparison is:
 
-These claims are **UNVERIFIED** for this repository and were reported under materially different hardware/resource assumptions, including 128 GB RAM and a much larger model footprint. They must remain separate from the current 32 GB correctness investigation until independently reproduced.
+1. ComfyUI FL2VA;
+2. h3.c FL2VA;
+3. h3.c Ref2VA.
+
+If FL2VA drifts in both runtimes but Ref2VA preserves identity, the earlier problem was a task-choice mismatch rather than a reference-routing defect.
+
+## External performance evidence
+
+A YouTube demonstration reported h3.c running MiniMax-H3 on an M3 Max with 36 GB unified memory using SSD streaming. It reported approximately 181–182 seconds for the H3 DiT portion of a short 20-step run.
+
+This is useful corroboration that low-memory Apple Silicon execution is practical, but it remains **external/unverified benchmark evidence** for this repository because the exact comparable resolution/revision/settings have not been reconstructed.
+
+A separate h3.c + lightx2v/Turbo lead remains optimisation-only evidence and stays outside the correctness critical path.
 
 ## Current conclusion
 
-The native 32B reference path has **not** been proven broken end-to-end. What has been proven is narrower and stronger:
+The investigation has narrowed substantially:
 
-> The entire upstream Qwen3VL reference-conditioning path is correct against the official MiniMax-H3 oracle and is demonstrably reference-sensitive. The remaining investigation must focus on H3 DiT/keyframe integration and, if that is also exonerated, reassess whether the original failure was caused by workflow or sampling configuration rather than a broken conditioning implementation.
+- vision tower: exonerated;
+- Qwen3VL/LLM propagation: exonerated;
+- tested DiT reference routing: exonerated;
+- current P0: DiT QKV checkpoint row semantics;
+- next independent oracle: h3.c FL2VA/Ref2VA after the QKV contract is resolved.
+
+No production patch should be made until the exact production-loaded QKV layout is established.
