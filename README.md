@@ -16,13 +16,16 @@ This repository exists to turn expensive trial-and-error into reusable evidence 
 The first series documents a real MiniMax-H3 video-generation bake-off on an M2 Max 32 GB machine, including:
 
 - a validated Qwen3-VL-4B BF16 + ClipProj baseline;
-- native MiniMax-H3 32B conditioning experiments;
+- Native MiniMax-H3 32B conditioning experiments;
 - two-process memory staging to avoid simultaneous encoder + DiT residency;
 - unified-memory / swap / jetsam observations;
 - measured 56-frame and 124-frame runs;
 - EasyCache measurements;
-- reference-image conditioning failures and current root-cause investigation;
-- reproducible workflow, downloader, and runbook artefacts.
+- a four-phase reference-conditioning root-cause investigation;
+- exact comparison against the official MiniMax-H3 encoder checkpoint;
+- proof that the local GGUF/mmproj vision tower and full 50-layer Qwen3VL/LLM conditioning path are correct and reference-sensitive;
+- the remaining blocker: H3 DiT/keyframe-conditioning integration;
+- reproducible workflow, downloader, runbook and diagnostic artefacts as they are validated.
 
 See [`experiments/minimax-h3/`](experiments/minimax-h3/README.md).
 
@@ -46,6 +49,7 @@ See [`experiments/minimax-h3/`](experiments/minimax-h3/README.md).
 5. Record failed approaches when they teach something reusable.
 6. Treat Apple Silicon as a unified-memory system: CPU offload is not the same as freeing physical RAM.
 7. Avoid re-running expensive experiments when an existing controlled result already answers the question.
+8. On constrained-memory Macs, use **parallel brains, serial GPU**: parallelise analysis, not heavy model residency or renders.
 
 ## Planned series
 
@@ -58,4 +62,4 @@ See [`experiments/minimax-h3/`](experiments/minimax-h3/README.md).
 
 ## Status
 
-This repository is being reconstructed from measured experiment logs and validated artefacts produced on the reference machine. Raw evidence and reproducible files will be added progressively rather than fabricated from memory.
+The MiniMax-H3 case study is active. The upstream reference-conditioning stack has been exonerated through controlled tensor and full-LLM A/B tests; current work is tracing H3 DiT/keyframe integration. Raw evidence and reproducible files are added progressively rather than reconstructed or fabricated from memory.
