@@ -25,8 +25,8 @@ The first series documents a real MiniMax-H3 video-generation investigation on a
 - exact comparison against the official MiniMax-H3 encoder checkpoint;
 - proof that the local GGUF/mmproj vision tower and full 50-layer Qwen3VL/LLM conditioning path are correct and reference-sensitive;
 - a controlled DiT A/C test showing the final predicted latent is materially reference-sensitive (`cosine=0.8372`, `relative L2=0.549`);
-- an independent `antirez/h3.c` validation track;
-- the current P0 question: whether the production DiT QKV tensor is already reordered to contiguous `[Q|K|V]` or still uses the released per-head-interleaved layout.
+- a resolved DiT QKV-layout audit proving that the production GGUF stores contiguous `[Q_all | K_all | V_all]`, matching ComfyUI's split semantics;
+- an independent `antirez/h3.c` validation track for FL2VA vs Ref2VA and low-memory Apple-Silicon performance.
 
 See [`experiments/minimax-h3/`](experiments/minimax-h3/README.md).
 
@@ -52,6 +52,7 @@ See [`experiments/minimax-h3/`](experiments/minimax-h3/README.md).
 7. Avoid re-running expensive experiments when an existing controlled result already answers the question.
 8. On constrained-memory Macs, use **parallel brains, serial GPU**: parallelise analysis, not heavy model residency or renders.
 9. When independent implementations disagree semantically, resolve the exact checkpoint contract before patching code.
+10. Distinguish **model task semantics** from implementation correctness: FL2VA first-frame anchoring and Ref2VA subject-reference conditioning are not interchangeable.
 
 ## Planned series
 
@@ -64,4 +65,14 @@ See [`experiments/minimax-h3/`](experiments/minimax-h3/README.md).
 
 ## Status
 
-The MiniMax-H3 case study is active. The reference signal is proven to survive through the Qwen3VL stack and the tested DiT path. Current work is no longer a generic routing hunt: it is a precise checkpoint-semantics audit, starting with H3 DiT QKV row layout and then an independent h3.c FL2VA/Ref2VA oracle comparison. Raw evidence and reproducible files are added progressively rather than reconstructed or fabricated from memory.
+The MiniMax-H3 implementation investigation is **closed with no actionable code defect found in the exercised path**. Vision loading, Qwen3VL propagation, DiT reference sensitivity and production QKV layout have all been validated.
+
+Current work has moved to an independent **h3.c validation campaign**:
+
+1. reproduce FL2VA first-frame behaviour in h3.c;
+2. run genuine Ref2VA subject-reference conditioning;
+3. compare ComfyUI FL2VA vs h3.c FL2VA vs h3.c Ref2VA;
+4. measure wall time, memory pressure and swap on the M2 Max 32 GB reference machine;
+5. keep Turbo/lightx2v optimisation separate until task semantics and baseline correctness are established.
+
+Raw evidence and reproducible files are added progressively rather than reconstructed or fabricated from memory.
