@@ -1,21 +1,22 @@
 # h3.c Validation Track
 
-Date: 2026-09-14  
+Date: 2026-09-14 to 2026-09-15  
 Reference machine: MacBook Pro M2 Max, 30-core GPU, 32 GB unified memory  
-Status: **active — h3.c adopted as an independent MiniMax-H3 correctness oracle; DiT QKV layout is the current P0 question**
+Status: **active — QKV layout gate resolved; controlled FL2VA/Ref2VA oracle campaign is next**
 
 ## Why this track exists
 
-The ComfyUI investigation has now exonerated the complete reference-conditioning path that was previously suspected:
+The ComfyUI implementation investigation has now exonerated the complete reference-conditioning path that was previously suspected:
 
 - Qwen3VL vision weights and mmproj loading are correct against the official MiniMax-H3 checkpoint;
 - GGMLOps and plain-ops execution are bit-identical;
 - Qwen3VL token placement, DeepStack injection and the full 50-layer LLM are reference-sensitive;
-- the production H3 DiT path is also reference-sensitive in a controlled real-reference vs ablated test.
+- the production H3 DiT path is reference-sensitive in a controlled real-reference vs ablated test;
+- the production DiT QKV checkpoint layout has been proven compatible with ComfyUI.
 
-The remaining question is therefore no longer simply whether the reference reaches the DiT. The next task is to verify that the DiT itself interprets the released checkpoint semantics correctly.
+`antirez/h3.c` remains valuable as an independent Apple-Silicon implementation using original MiniMax-H3 BF16 checkpoints rather than the current ComfyUI/GGUF stack.
 
-`antirez/h3.c` is useful here because it is an independent Apple-Silicon implementation using the original MiniMax-H3 BF16 checkpoints rather than the current ComfyUI/GGUF execution stack.
+Its purpose is now **independent validation, task-semantics comparison and low-memory performance measurement**, not generic bug hunting.
 
 ## Phase 5 result — DiT conditioning path is reference-sensitive
 
@@ -44,15 +45,12 @@ The static trace confirmed that MiniMax conditioning, token tags, keyframe rows 
 
 A real conditional defect was found in ComfyUI's scheduled CLIP path: when `use_clip_schedule=True`, one branch can rebuild the output dictionary without preserving extras such as `minimax_token_tags`. This did **not** affect the exercised workflow; captured DiT input contained populated image tags.
 
-**Conclusion:** the previously exercised DiT/keyframe path is reference-sensitive. The original long-video identity drift should not be attributed to a silent reference-routing failure without new evidence.
-
 ## Independent oracle: antirez/h3.c
 
 Repository:
 
 - upstream: `https://github.com/antirez/h3.c`
 - pinned HEAD verified during this investigation: `8974cc055ea9c02fcd14cc27dfda3e1027c05153`
-- commit message: `Clarify SSD streaming memory and speed tradeoff`
 
 At that revision, h3.c provides:
 
@@ -66,84 +64,155 @@ At that revision, h3.c provides:
 
 ### 32 GB relevance
 
-`--ssd-streaming` keeps only a small rotating set of DiT blocks resident and reads subsequent blocks from SSD while the GPU runs the current block. Upstream reports this as an explicit memory/speed trade-off and recommends omitting `--show` on low-memory systems because preview-VAE residency adds substantial memory pressure.
+`--ssd-streaming` lowers DiT residency by reading blocks from SSD during execution. This is a deliberate memory/speed trade-off and independently supports the local finding that **weight residency lifetime is a primary engineering constraint on Apple Silicon**, not simply nominal model size.
 
-This supports the local Stage-A / Stage-B finding that **weight residency lifetime is a primary engineering constraint on Apple Silicon**, not simply nominal model size.
-
-Operational policy for this repository remains:
+Operational policy:
 
 > **Parallel brains, serial GPU.**
 
 Only one heavy H3/Qwen/Metal workload or render should run at a time on the 32 GB reference machine.
 
-## Critical new discrepancy: H3 DiT QKV layout
+## Resolved gate — H3 DiT QKV layout
 
-The upstream h3.c README explicitly states that the released H3 DiT checkpoint stores QKV rows **interleaved per attention head** and that an earlier identity interpretation caused noisy diagnostic outputs.
+h3.c documents the released raw MiniMax-H3 DiT checkpoint as storing QKV rows **interleaved per attention head**.
 
-h3.c implements grouped/per-head QKV consumption in its DiT path. Its tests also describe the released H3 checkpoint as emitting QKV interleaved per head.
-
-By contrast, current ComfyUI MiniMax-H3 attention performs a conventional three-way split:
+Current ComfyUI MiniMax-H3 attention performs a conventional three-way split:
 
 ```python
 q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
 ```
 
-This is a real implementation-level semantic difference, but it is **not yet proof of a ComfyUI defect**.
+The important caveat was that Comfy-oriented checkpoints may already be regrouped before runtime.
 
-The local production DiT is a converted GGUF. Its conversion pipeline may already reorder the raw per-head-interleaved H3 QKV tensor into contiguous `[Q_all | K_all | V_all]` rows before ComfyUI executes the split above.
+The exact production GGUF was therefore audited rather than assuming that all H3 checkpoints share one physical layout.
 
-Therefore the current P0 question is:
+### Loader trace
 
-> **What is the actual QKV row layout of the exact production DiT tensor loaded by this workflow?**
+For the production DiT GGUF:
 
-Do not infer this from shape, mean, standard deviation, RMS or L2. A pure row permutation preserves aggregate statistics.
+- `UnetLoaderGGUF.load_unet()` uses `gguf_sd_loader(unet_path)`;
+- the UNET/DiT path applies no MiniMax-specific QKV permutation;
+- `blocks.0.attn.qkv_proj.weight` retains its PyTorch key;
+- `comfy.gguf.orig_shape.*` metadata is consistent with generic ComfyUI-GGUF quantisation.
 
-## Required P0 validation
+The GGUF loader therefore preserves the pre-quantisation row order.
 
-For the exact local DiT GGUF used by the successful Stage-B run:
+### Structural proof
 
-1. Record filename, size, SHA-256, source and converter lineage where recoverable.
-2. Trace the complete loader/converter/state-dict path for `blocks.*.attn.qkv_proj.weight`.
-3. Extract a real production-loaded QKV tensor after all dequantisation/remapping.
-4. Compare two explicit semantic interpretations:
-   - contiguous: `[Q_all | K_all | V_all]`;
-   - raw grouped: `[h0 Q,K,V][h1 Q,K,V]...`.
-5. Use row fingerprints, row-wise cosine matching and exact permutation recovery rather than aggregate norms.
-6. Compare against h3.c's grouped-QKV contract and, if required, a minimal official checkpoint tensor/shard.
+The official vanilla Ref2VA tensor and the local production tensor were tested independently under both candidate layouts.
 
-Decision states:
+| Tensor | Hypothesis | matched-minus-mismatched `|cosine|` gap | Q·Kᵀ diagonal/off-diagonal | Verdict |
+|---|---|---:|---:|---|
+| Official vanilla | contiguous | `0.00026` | `0.96` | wrong |
+| Official vanilla | grouped | `0.03116` | **`4.60`** | **correct** |
+| Local production GGUF | contiguous | `0.03098` | **`4.61`** | **correct** |
+| Local production GGUF | grouped | `0.00008` | `1.40` | wrong |
 
-- **contiguous confirmed**: ComfyUI's current split is correct for this converted file; close the hypothesis and resume FL2VA/Ref2VA oracle renders;
-- **interleaved confirmed**: this is a concrete DiT correctness defect; demonstrate it on one block before patching production code;
-- **unresolved**: download only the minimum official shard/tensor required for byte-level verification rather than the full H3 repository.
+**Result:**
 
-## FL2VA vs Ref2VA: keep task semantics separate
+- official raw checkpoint: grouped/per-head interleaved;
+- local production checkpoint: contiguous `[Q_all | K_all | V_all]`.
+
+The local pruned checkpoint had already been regrouped before generic GGUF quantisation. ComfyUI's current split is therefore correct for the exact production file.
+
+The QKV bug hypothesis is closed. No patch is warranted.
+
+Detailed evidence: [`QKV-LAYOUT-AUDIT.md`](QKV-LAYOUT-AUDIT.md).
+
+## FL2VA vs Ref2VA: the next real question
 
 h3.c exposes two distinct conditioning modes:
 
-- first/last-frame anchors for FL2VA;
-- ordered `--ref-image` / reference media for Ref2VA.
+- first/last-frame anchors for **FL2VA**;
+- ordered `--ref-image` / reference media for **Ref2VA**.
 
 These must not be treated as interchangeable when evaluating identity preservation.
 
-After QKV layout is resolved, the planned independent oracle campaign is:
+The original symptom — frame 0 matches the reference and later frames drift — may be consistent with FL2VA first-frame anchoring rather than a code defect.
 
-1. reproduce the existing first-frame/FL2VA semantics in h3.c;
-2. run genuine Ref2VA with the correct Ref2VA checkpoint family;
-3. compare ComfyUI FL2VA vs h3.c FL2VA vs h3.c Ref2VA;
-4. separate identity-retention conclusions from runtime/optimisation conclusions.
+## Controlled h3.c campaign
+
+### Phase A — build and pin
+
+- clone the verified upstream revision;
+- record commit SHA, toolchain, macOS version and build command;
+- build unmodified;
+- do not patch before baseline validation.
+
+### Phase B — model inventory
+
+Before downloading anything large:
+
+- inventory existing local MiniMax-H3 files;
+- determine exact FL2VA and Ref2VA files required by the pinned h3.c revision;
+- reuse/symlink only when byte identity and semantic compatibility are proven;
+- calculate unique additional download bytes first.
+
+### Phase C — h3.c FL2VA
+
+Reproduce the existing first-frame semantics as closely as practical:
+
+- same reference image;
+- equivalent prompt;
+- portrait orientation;
+- short but meaningful temporal length, preferably 22 frames;
+- fixed seed where supported;
+- `--ssd-streaming`;
+- no preview mode on the 32 GB machine.
+
+Run a smoke test first, then a normal 20-step correctness run if the smoke path is valid.
+
+### Phase D — h3.c Ref2VA
+
+Run the same subject/reference using the correct Ref2VA checkpoint and `--ref-image`.
+
+Do not mix Ref2VA references with FL2VA first/last-frame anchors.
+
+### Phase E — compare
+
+Compare:
+
+1. ComfyUI FL2VA;
+2. h3.c FL2VA;
+3. h3.c Ref2VA.
+
+Evaluate separately:
+
+- frame-0/reference match;
+- identity retention over time;
+- composition;
+- motion;
+- hallucination/drift;
+- wall-clock time;
+- memory pressure;
+- swap growth.
+
+Do not claim speed ratios unless resolution, frames, steps, layers and sampling semantics are genuinely comparable.
+
+## Decision rules
+
+### ComfyUI FL2VA ≈ h3.c FL2VA, Ref2VA materially better
+
+Interpret the original problem primarily as **task semantics**: FL2VA anchoring was being asked to provide Ref2VA-like identity preservation.
+
+### h3.c FL2VA materially better than ComfyUI FL2VA
+
+Reopen a focused runtime semantic-differential audit. Do not reopen already exonerated vision/LLM hypotheses generically.
+
+### FL2VA and Ref2VA both drift similarly
+
+Treat the remaining limitation as a model/sampling/reference-distribution issue unless new evidence contradicts that conclusion.
 
 ## Minimal h3.c development shapes
 
 Relevant upstream guidance at the pinned revision:
 
 - width and height must be multiples of 32;
-- 512x512 is the repeatedly validated development size;
-- 256x256 is an explicitly supported fast-preview size with special low-resolution RoPE handling;
-- 22 frames is the standard short development clip (~0.917 s at 24 fps);
-- 4-step runs are useful for rapid diagnostics but are not final-quality references;
-- 20 steps is the normal default path;
-- 50 steps is the slow reference-quality oracle path.
+- 512x512 is a repeatedly validated development size;
+- 256x256 is a fast-preview size with special low-resolution handling;
+- 22 frames is the standard short development clip;
+- low-step runs are useful for diagnostics but not final quality judgements;
+- 20 steps is the normal baseline path.
 
 For exact portrait 9:16, `288x512` is mechanically aligned to multiples of 32, but should be treated as a diagnostic shape rather than an upstream validated quality point.
 
@@ -151,24 +220,17 @@ For exact portrait 9:16, `288x512` is mechanically aligned to multiples of 32, b
 
 One independent YouTube demonstration reported MiniMax-H3 running through h3.c on an M3 Max with 36 GB unified memory using SSD streaming and the official large checkpoint. It reported approximately 181–182 seconds for the H3 DiT portion of a short 20-step run.
 
-This is useful corroboration that low-memory Apple Silicon execution is practical, but it is **external/unverified benchmark evidence** for this repository because the exact resolution, model revision and full comparable settings were not reconstructed from the transcript alone.
+This remains **external/unverified benchmark evidence** because the exact resolution, revision and fully comparable settings have not been reconstructed.
 
-A separate community report about h3.c plus a lightx2v/Turbo patch remains an optimisation lead, not correctness evidence. Turbo work stays out of the critical path until the QKV/task-semantics questions are closed.
-
-## Source references
-
-- h3.c upstream: `https://github.com/antirez/h3.c`
-- pinned h3.c commit: `8974cc055ea9c02fcd14cc27dfda3e1027c05153`
-- h3.c README section: checkpoint layout and media pipeline
-- h3.c grouped-QKV implementation: `h3_dit.c`, `h3_gpu.h`, `h3_shaders.metal`
-- h3.c grouped-QKV validation: `tests/test_bf16.c`, `tests/test_real_dit_block.c`
-- ComfyUI MiniMax-H3 attention: `comfy/ldm/minimax/model.py`
+A separate h3.c + lightx2v/Turbo path remains an optimisation lead only. Turbo stays outside the baseline until the FL2VA/Ref2VA comparison is established.
 
 ## Current status
 
-The original reference-conditioning investigation has moved through two distinct conclusions:
+The implementation-bug investigation is closed for the exercised ComfyUI path.
 
-1. **Reference routing is functioning** through Qwen3VL and through the tested DiT path.
-2. **DiT checkpoint semantics are now under audit**, with QKV row layout the highest-information unresolved question.
+The active h3.c work is now:
 
-No production patch should be made until the actual loaded QKV layout is established by exact tensor-level evidence.
+1. independent FL2VA confirmation;
+2. genuine Ref2VA identity-preservation test;
+3. M2 Max 32 GB memory/runtime characterisation;
+4. only then, optimisation work.
