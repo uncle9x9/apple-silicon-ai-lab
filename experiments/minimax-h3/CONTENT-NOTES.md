@@ -4,7 +4,7 @@ Purpose: factual source material for a future blog post, tutorial or YouTube vid
 
 ## One-line story
 
-A MiniMax-H3 identity-drift problem on a 32 GB M2 Max first looked like a broken vision/conditioning path, but five controlled phases exonerated reference routing through the DiT. The next high-value question is lower-level: whether the converted DiT QKV tensor preserves the checkpoint row semantics expected by the runtime.
+A MiniMax-H3 identity-drift problem on a 32 GB M2 Max initially looked like a broken vision/conditioning path. Six controlled phases instead proved that the exercised ComfyUI path is internally consistent — including the final DiT QKV checkpoint contract — shifting the story from bug hunting to task semantics: FL2VA first-frame anchoring vs genuine Ref2VA subject-reference conditioning.
 
 ## What was difficult
 
@@ -12,6 +12,7 @@ A MiniMax-H3 identity-drift problem on a 32 GB M2 Max first looked like a broken
 - Encoder + DiT simultaneous residency can exceed the practical memory envelope.
 - Cross-model activation magnitudes can look suspicious even when both models are correct.
 - A tensor can load with the correct shape while still being semantically misinterpreted.
+- Different H3 checkpoint families can store the same logical QKV projection in different physical row layouts.
 - Long video generations are expensive and can have low diagnostic value.
 - FL2VA first-frame anchoring and Ref2VA subject-reference conditioning are different tasks and must not be judged as if they were equivalent.
 
@@ -23,8 +24,10 @@ A MiniMax-H3 identity-drift problem on a 32 GB M2 Max first looked like a broken
 4. **Verify against the exact official checkpoint whenever possible.** The official MiniMax-H3 shard resolved the DeepStack/merger ambiguity immediately.
 5. **Prove information flow, not just tensor presence.** Reference-present vs ablated tests showed that image information changes both the full LLM conditioning and the final DiT-predicted latent.
 6. **On a 32 GB unified-memory Mac: parallel brains, serial GPU.** Parallel code/reasoning agents are useful; concurrent heavy model loads and renders are not.
-7. **A pure tensor permutation can preserve mean/std/L2 while destroying attention semantics.** When layout is in question, recover exact row permutations rather than trusting aggregate statistics.
-8. **Use independent implementations as semantic oracles.** `antirez/h3.c` is valuable because it consumes the original BF16 checkpoint through a different Apple-Silicon runtime.
+7. **A pure tensor permutation can preserve mean/std/L2 while destroying attention semantics.** When layout is in question, recover exact row structure rather than trusting aggregate statistics.
+8. **Checkpoint layout is part of the model contract.** Raw H3 and Comfy-oriented H3 checkpoints can use different QKV row arrangements even when names and shapes match.
+9. **Use independent implementations as semantic oracles.** `antirez/h3.c` exposed the QKV contract question and remains valuable for FL2VA/Ref2VA comparison.
+10. **Separate implementation correctness from task choice.** First-frame anchoring is not the same problem as persistent subject identity conditioning.
 
 ## Measured highlights
 
@@ -101,23 +104,45 @@ Conclusion: the tested reference path is not silently dropped at the DiT boundar
 
 A scheduled-CLIP branch can drop extras such as `minimax_token_tags` when `use_clip_schedule=True`; this is a real conditional defect but was empirically absent from the exercised workflow.
 
-## Why h3.c changed the investigation
+### Phase 6 — the QKV surprise
 
-Pinned upstream: `antirez/h3.c` @ `8974cc055ea9c02fcd14cc27dfda3e1027c05153`.
+`antirez/h3.c` documents raw H3 DiT QKV as per-head interleaved, while ComfyUI consumes contiguous `[Q_all | K_all | V_all]`.
 
-h3.c documents the released MiniMax-H3 **DiT** QKV tensor as per-head interleaved and consumes that grouped layout directly. Current ComfyUI MiniMax attention instead performs a conventional three-way Q/K/V split.
+This initially looked like the first true smoking gun.
 
-This does **not** yet prove ComfyUI is wrong: the local GGUF conversion may already reorder the raw checkpoint into the layout ComfyUI expects.
+The decisive follow-up proved otherwise:
 
-The current P0 test is therefore exact and cheap relative to a full render:
+- official vanilla H3 tensor is structurally grouped/per-head interleaved;
+- exact production GGUF tensor is structurally contiguous;
+- generic GGUF loading does not perform a MiniMax-specific reorder;
+- therefore the production pruned checkpoint had already been regrouped before quantisation;
+- ComfyUI's current split is correct for that checkpoint.
 
-> Recover the real production-loaded DiT QKV row layout and converter lineage.
+Structural signature:
 
-Use row hashes, row-wise cosine matching and exact permutation recovery. Do not use mean/std/RMS/L2 as the discriminator.
+- official grouped Q·Kᵀ diagonal/off-diagonal ratio: `4.60`;
+- local contiguous ratio: `4.61`;
+- wrong-layout hypotheses collapse toward noise.
+
+Lesson:
+
+> **Same model family and same tensor shape do not imply the same physical checkpoint contract.**
+
+## Why h3.c still matters
+
+Pinned upstream during this investigation:
+
+`antirez/h3.c @ 8974cc055ea9c02fcd14cc27dfda3e1027c05153`
+
+h3.c no longer serves mainly as a bug oracle. Its next value is independent validation:
+
+- does h3.c FL2VA reproduce the same identity drift?
+- does genuine h3.c Ref2VA retain subject identity better?
+- how does original-BF16 SSD streaming behave on M2 Max 32 GB?
 
 ## FL2VA vs Ref2VA
 
-This is now part of the story, not a footnote.
+This is now the central next question.
 
 - **FL2VA:** first/last-frame anchor semantics.
 - **Ref2VA:** ordered subject/reference media.
@@ -153,7 +178,8 @@ A separate community h3.c + lightx2v/Turbo acceleration path remains a later opt
 4. Phase 1–3: progressively proving the vision stack correct.
 5. Phase 4: proving the image genuinely changes the 50-layer LLM.
 6. Phase 5: proving the reference also changes the actual DiT output.
-7. The surprise: an independent h3.c implementation exposes a deeper checkpoint-layout question.
-8. Why shape/statistics are not enough when QKV rows may be permuted.
-9. FL2VA vs Ref2VA: are we asking the model to solve the right task?
-10. The Apple-Silicon lesson: stage memory, use tiny discriminating tests, and separate correctness from optimisation.
+7. The apparent smoking gun: h3.c says raw DiT QKV is interleaved, while ComfyUI splits contiguously.
+8. The resolution: both are correct because they consume different checkpoint layouts.
+9. Why shape/mean/std are insufficient to validate tensor semantics.
+10. FL2VA vs Ref2VA: are we asking the model to solve the right identity problem?
+11. The Apple-Silicon lesson: stage memory, use tiny discriminating tests, and separate correctness from optimisation.
