@@ -1,21 +1,22 @@
 # MiniMax-H3 on MacBook Pro M2 Max 32 GB
 
-Status: **active — reference routing exonerated; current P0 is H3 DiT QKV checkpoint semantics, with h3.c as an independent oracle**
+Status: **implementation investigation closed; independent h3.c FL2VA/Ref2VA validation is next**
 
 This case study records measured MiniMax-H3 experiments on a MacBook Pro M2 Max with 30-core GPU and 32 GB unified memory.
 
 See also:
 
-- [`INVESTIGATION-2026-09-14.md`](INVESTIGATION-2026-09-14.md) — Phase 1–5 evidence;
-- [`H3C-VALIDATION.md`](H3C-VALIDATION.md) — h3.c oracle track and QKV-layout gate;
+- [`INVESTIGATION-2026-09-14.md`](INVESTIGATION-2026-09-14.md) — Phase 1–6 evidence;
+- [`QKV-LAYOUT-AUDIT.md`](QKV-LAYOUT-AUDIT.md) — resolved DiT checkpoint-layout audit;
+- [`H3C-VALIDATION.md`](H3C-VALIDATION.md) — independent h3.c oracle track;
 - [`DECISIONS.md`](DECISIONS.md) — engineering decisions;
-- [`CONTENT-NOTES.md`](CONTENT-NOTES.md) — concise factual source material for future blog/YouTube content.
+- [`CONTENT-NOTES.md`](CONTENT-NOTES.md) — factual source material for future blog/YouTube content.
 
 ## Current conclusion
 
-The original Native 32B reference-adherence failure is **not explained by a broken reference-routing path**.
+No actionable code defect has been found in the exercised reference-conditioning path.
 
-Controlled experiments now establish:
+Controlled experiments establish:
 
 - production GGMLOps vs plain ops: bit-identical;
 - local GGUF/mmproj vision weights vs official MiniMax-H3 encoder shard: bit-identical;
@@ -23,7 +24,8 @@ Controlled experiments now establish:
 - DeepStack `8/16/24 -> 0/1/2`: correct;
 - image-token placement, masks and DeepStack injection: consistent;
 - full 50-layer Qwen3VL/LLM path: reference-sensitive;
-- the tested H3 DiT path: also reference-sensitive.
+- the tested H3 DiT path: reference-sensitive;
+- the exact production DiT QKV layout is **contiguous `[Q_all | K_all | V_all]`**, matching ComfyUI's three-way split.
 
 A controlled production DiT test at 288x512 / 5 frames / 2 steps compared real reference vs ablated reference and measured:
 
@@ -32,19 +34,30 @@ A controlled production DiT test at 288x512 / 5 frames / 2 steps compared real r
 - progressive divergence through DiT blocks;
 - no NaN/Inf.
 
-Therefore the reference is not silently dropped before or inside the tested DiT path.
+Therefore the original long-video identity drift is no longer best explained by a silent routing, loading or QKV-layout defect. The remaining questions are now **task semantics and model/workflow behaviour**, especially FL2VA first-frame anchoring versus genuine Ref2VA subject/reference conditioning.
 
-## Current P0: DiT QKV checkpoint layout
+## Resolved QKV checkpoint-layout audit
 
-Independent upstream `antirez/h3.c` documents the released MiniMax-H3 DiT checkpoint as storing QKV rows **interleaved per attention head**. h3.c consumes that layout directly.
+`antirez/h3.c` correctly documents the released raw MiniMax-H3 DiT checkpoint as using per-head interleaved QKV rows. Current ComfyUI consumes a contiguous `[Q_all | K_all | V_all]` layout.
 
-Current ComfyUI MiniMax-H3 attention performs a conventional three-way split of `qkv_proj(x)` into contiguous Q/K/V blocks.
+This looked like a possible implementation discrepancy, but the production GGUF was audited directly.
 
-This is a concrete semantic difference, but **not yet proof of a ComfyUI bug**, because the local GGUF conversion may already reorder the raw checkpoint into contiguous `[Q_all | K_all | V_all]` layout.
+Result:
 
-The next decisive test is therefore not another full render. It is an exact tensor-level audit of the production-loaded DiT QKV tensor and its converter lineage.
+- official vanilla checkpoint: **grouped/per-head interleaved**;
+- local production GGUF: **contiguous `[Q_all | K_all | V_all]`**;
+- generic GGUF loading performs no MiniMax-specific permutation;
+- therefore the local pruned checkpoint had already been regrouped before quantisation;
+- ComfyUI's current `Attention.forward()` split is correct for the file actually used in production.
 
-See [`H3C-VALIDATION.md`](H3C-VALIDATION.md).
+Structural evidence:
+
+| Tensor | Correct hypothesis | matched-minus-mismatched `|cosine|` gap | Q·Kᵀ diagonal/off-diagonal |
+|---|---|---:|---:|
+| Official vanilla | grouped | `0.03116` | `4.60` |
+| Local production GGUF | contiguous | `0.03098` | `4.61` |
+
+See [`QKV-LAYOUT-AUDIT.md`](QKV-LAYOUT-AUDIT.md).
 
 ## Known-good baseline
 
@@ -59,8 +72,6 @@ Measured 56-frame run:
 - sampling/decode: approximately 454–501 s depending on run;
 - peak resident memory observed during bake-off: approximately 30.98 GB.
 
-This remains the safest tested lane while the Native 32B task/checkpoint semantics are being validated.
-
 ## Native 32B Q4
 
 Native Q4 conditioning is computationally viable with staged execution.
@@ -71,9 +82,9 @@ Earlier full-video runs showed:
 - later frames lose reference adherence;
 - the same unrelated subject appeared under Q2 and Q4.
 
-The earlier hypotheses that the native vision tower, Qwen3VL propagation or DiT reference routing were broken are now retired for the tested path.
+Earlier hypotheses that the native vision tower, Qwen3VL propagation, DiT routing or DiT QKV interpretation were broken are now retired for the exercised path.
 
-Native Q4 remains **experimental** because the current open question is deeper: whether the converted DiT QKV layout matches the semantics assumed by ComfyUI.
+Native Q4 remains **experimental**, not because of an identified implementation defect, but because the intended identity-preservation task may require Ref2VA rather than FL2VA first-frame anchoring.
 
 ## Native 32B Q2
 
@@ -146,25 +157,23 @@ The real-reference Stage B run took approximately 96 s total. This timing is a d
 
 ## h3.c validation track
 
-`antirez/h3.c` is now a required independent reference implementation, not merely an acceleration lead.
+`antirez/h3.c` is retained as a required independent reference implementation, but its role has changed.
 
-At pinned upstream HEAD `8974cc055ea9c02fcd14cc27dfda3e1027c05153`, it provides:
+It is no longer being used primarily to hunt for a ComfyUI code defect. The QKV discrepancy has been resolved as a checkpoint-contract difference.
 
-- original-BF16 MiniMax-H3 inference on Apple Silicon;
-- FL2VA first/last-frame conditioning;
-- ordered Ref2VA references;
-- SSD streaming for low-memory operation;
-- validated 22-frame development presets;
-- direct grouped/per-head H3 DiT QKV handling.
+The next controlled campaign is:
 
-The planned sequence is:
-
-1. resolve the exact production GGUF DiT QKV layout;
-2. if contiguous, close the QKV hypothesis;
-3. then reproduce FL2VA in h3.c;
-4. run genuine Ref2VA separately;
+1. build and pin h3.c unmodified;
+2. inventory/reuse local model files before downloading anything large;
+3. reproduce FL2VA first-frame semantics in h3.c;
+4. run genuine Ref2VA using the correct checkpoint family;
 5. compare ComfyUI FL2VA vs h3.c FL2VA vs h3.c Ref2VA;
-6. only then revisit optimisation such as Turbo/lightx2v.
+6. measure wall time, memory pressure and swap on the M2 Max 32 GB machine;
+7. keep Turbo/lightx2v optimisation outside the correctness baseline.
+
+Pinned upstream revision already verified during the investigation:
+
+`8974cc055ea9c02fcd14cc27dfda3e1027c05153`
 
 ## FL2VA vs Ref2VA
 
@@ -173,7 +182,9 @@ Do not equate first-frame anchoring with subject-reference conditioning.
 - **FL2VA:** first/last-frame anchors;
 - **Ref2VA:** ordered subject/reference media.
 
-If FL2VA drifts but Ref2VA preserves identity, the earlier experiment was testing the wrong task family for the intended identity-preservation objective rather than exposing a reference-routing bug.
+Current highest-value hypothesis:
+
+> If ComfyUI FL2VA and h3.c FL2VA both drift, but h3.c Ref2VA preserves identity, the original experiment was testing the wrong task family for the intended identity-preservation objective rather than exposing a code defect.
 
 ## Historical corrections
 
@@ -182,6 +193,7 @@ Retired conclusions:
 1. **“32B is impossible on 32 GB.”** False as a blanket rule. Simultaneous residency was the main failure mode; staged execution makes Native 32B conditioning viable.
 2. **“The native vision tower is numerically wrong.”** False. The local GGUF/mmproj vision path is bit-identical to the official H3 encoder.
 3. **“Reference information is being dropped before the DiT.”** False for the tested graph. The Qwen3VL path and final predicted latent both respond materially to the reference.
+4. **“ComfyUI may be misreading raw interleaved H3 DiT QKV.”** False for the exact production checkpoint. The production GGUF is already contiguous and matches ComfyUI semantics.
 
 ## Artefacts still to publish
 
@@ -192,6 +204,5 @@ Retired conclusions:
 - raw benchmark logs and exact generation-time reconstruction;
 - representative reference-conditioning frames;
 - `h3_condio` implementation and audit notes;
-- production-loaded DiT QKV layout proof;
 - h3.c build/model manifest;
 - controlled FL2VA/Ref2VA oracle outputs.

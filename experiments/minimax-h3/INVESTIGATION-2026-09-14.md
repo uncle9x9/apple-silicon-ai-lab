@@ -1,14 +1,16 @@
 # MiniMax-H3 Native Reference-Conditioning Investigation
 
-Date: 2026-09-14  
+Date: 2026-09-14 to 2026-09-15  
 Machine: MacBook Pro, M2 Max, 30-core GPU, 32 GB unified memory  
-Status: **active; reference routing exonerated through DiT, current P0 is H3 DiT QKV checkpoint layout**
+Status: **implementation investigation closed; no actionable code defect found in the exercised path**
 
 ## Problem statement
 
-Native MiniMax-H3 32B Q4 conditioning is computationally viable with staged execution, but earlier full-video runs showed poor reference adherence after frame 0. The investigation therefore focused on locating the first point where reference-image information was lost, corrupted or semantically misinterpreted.
+Native MiniMax-H3 32B Q4 conditioning is computationally viable with staged execution, but earlier full-video runs showed poor reference adherence after frame 0. The investigation focused on locating the first point where reference-image information was lost, corrupted or semantically misinterpreted.
 
-The governing rule is: **do not patch or optimise until a discriminating experiment identifies the failing contract.**
+The governing rule was: **do not patch or optimise until a discriminating experiment identifies the failing contract.**
+
+That rule eliminated several plausible but incorrect hypotheses and ultimately closed the implementation-bug investigation without finding an actionable defect.
 
 ## Phase 1 — GGMLOps vs plain ops
 
@@ -189,25 +191,60 @@ This did **not** affect the tested workflow. The captured DiT boundary contained
 
 **Conclusion:** the tested H3 DiT/keyframe path is reference-sensitive. The original full-video drift is not explained by a silent reference-routing failure.
 
-## New validation track — antirez/h3.c
+## Phase 6 — Production DiT QKV checkpoint-layout audit
 
-An independent Apple-Silicon implementation is now used as a correctness oracle:
+The independent `antirez/h3.c` implementation exposed a deeper checkpoint-contract question.
 
-- repository: `https://github.com/antirez/h3.c`
-- pinned HEAD: `8974cc055ea9c02fcd14cc27dfda3e1027c05153`
-- current upstream focus: native MiniMax-H3 inference, FL2VA/Ref2VA, Metal optimisation and SSD-streamed low-memory execution.
+h3.c documents the released raw H3 DiT QKV tensor as **per-head grouped/interleaved**:
 
-The h3.c README and tests state that the released MiniMax-H3 **DiT** checkpoint stores QKV rows **interleaved per attention head**. h3.c consumes this grouped layout directly.
+```text
+[h0 Q,K,V][h1 Q,K,V]...
+```
 
-Current ComfyUI MiniMax-H3 attention performs a conventional three-way split of `qkv_proj(x)` into large Q/K/V blocks.
+Current ComfyUI MiniMax-H3 attention consumes a conventional contiguous layout:
 
-This is a real semantic discrepancy, but it is **not yet proof of a ComfyUI defect** because the production GGUF conversion may already reorder the raw checkpoint into the contiguous layout ComfyUI expects.
+```text
+[Q_all | K_all | V_all]
+```
 
-Therefore the current P0 question is:
+This initially looked like a possible implementation defect, but a critical caveat was recognised: Comfy-oriented checkpoints may be repacked before runtime.
 
-> **What row layout is actually present in the exact production-loaded DiT QKV tensor?**
+### Loader/converter trace
 
-The next test must recover that layout using exact row/permutation evidence, not aggregate norms.
+For the exact production GGUF:
+
+- `UnetLoaderGGUF.load_unet()` calls `gguf_sd_loader(unet_path)`;
+- the DiT/UNET loader applies no architecture-specific QKV permutation;
+- tensor name remains `blocks.0.attn.qkv_proj.weight`;
+- `comfy.gguf.orig_shape.*` metadata indicates the generic ComfyUI-GGUF quantisation path.
+
+Therefore the production GGUF preserves the pre-quantisation row order.
+
+### Official raw tensor vs production checkpoint
+
+A pristine official `Ref2VA/transformer` block-0 QKV tensor was retrieved at tensor level.
+
+The production pruned checkpoint is not merely a reordered copy of the vanilla official checkpoint:
+
+- position-wise mean cosine: `0.028`;
+- median cosine: `0.001`.
+
+This required a structural self-consistency test rather than direct row equality.
+
+### Structural result
+
+| Tensor | Hypothesis | matched-minus-mismatched `|cosine|` gap | head-0 Q·Kᵀ diagonal/off-diagonal | Verdict |
+|---|---|---:|---:|---|
+| Official vanilla | contiguous | `0.00026` | `0.96` | wrong grouping |
+| Official vanilla | grouped | `0.03116` | **`4.60`** | **correct grouping** |
+| Local production GGUF | contiguous | `0.03098` | **`4.61`** | **correct grouping** |
+| Local production GGUF | grouped | `0.00008` | `1.40` | wrong grouping |
+
+**Conclusion:** the exact production DiT QKV is already **contiguous `[Q_all | K_all | V_all]`**. ComfyUI's current three-way split is correct for this file. The raw h3.c and ComfyUI behaviours differ because they consume different checkpoint contracts, not because one runtime is necessarily wrong.
+
+No QKV patch should be applied.
+
+Detailed evidence: [`QKV-LAYOUT-AUDIT.md`](QKV-LAYOUT-AUDIT.md).
 
 ## 32 GB unified-memory constraint
 
@@ -226,20 +263,20 @@ h3.c's `--ssd-streaming` mode is especially relevant because it explicitly trade
 
 ## FL2VA vs Ref2VA
 
-The investigation must keep task semantics separate:
+The remaining investigation is now semantic rather than implementation-level:
 
 - **FL2VA:** first/last-frame anchoring;
 - **Ref2VA:** ordered subject/reference media.
 
 A long-video identity drift under first-frame anchoring does not establish that Ref2VA is broken.
 
-After the QKV-layout question is closed, the planned independent comparison is:
+The next independent comparison is:
 
 1. ComfyUI FL2VA;
 2. h3.c FL2VA;
 3. h3.c Ref2VA.
 
-If FL2VA drifts in both runtimes but Ref2VA preserves identity, the earlier problem was a task-choice mismatch rather than a reference-routing defect.
+If FL2VA drifts in both runtimes but Ref2VA preserves identity, the earlier problem was a task-choice mismatch rather than a code defect.
 
 ## External performance evidence
 
@@ -249,14 +286,15 @@ This is useful corroboration that low-memory Apple Silicon execution is practica
 
 A separate h3.c + lightx2v/Turbo lead remains optimisation-only evidence and stays outside the correctness critical path.
 
-## Current conclusion
+## Final implementation conclusion
 
-The investigation has narrowed substantially:
+The code-defect investigation is closed for the exercised path:
 
 - vision tower: exonerated;
 - Qwen3VL/LLM propagation: exonerated;
 - tested DiT reference routing: exonerated;
-- current P0: DiT QKV checkpoint row semantics;
-- next independent oracle: h3.c FL2VA/Ref2VA after the QKV contract is resolved.
+- production DiT QKV interpretation: exonerated.
 
-No production patch should be made until the exact production-loaded QKV layout is established.
+No production patch is justified by the current evidence.
+
+The next phase is **independent h3.c validation**, not further generic bug hunting. Its goals are task-semantics comparison (FL2VA vs Ref2VA), independent runtime confirmation, and M2 Max 32 GB memory/performance measurement.
